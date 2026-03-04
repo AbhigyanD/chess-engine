@@ -179,17 +179,25 @@ class MultiHeadAttention(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+        past_key_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             query: (batch, seq_len_q, d_model)
             key:   (batch, seq_len_k, d_model)
             value: (batch, seq_len_k, d_model)
             mask:  Optional; True = masked. Shape broadcastable to (batch, 1, seq_len_q, seq_len_k).
+            rope_cos, rope_sin: Optional (seq_len, d_k/2) for RoPE on Q and K.
+            past_key_value: Optional (past_k, past_v) for KV cache.
+            use_cache: If True, return updated (K, V) as third output.
 
         Returns:
             output: (batch, seq_len_q, d_model)
             attention_weights: (batch, h, seq_len_q, seq_len_k)
+            past_kv: (K, V) if use_cache else None
         """
         batch = query.size(0)
 
@@ -201,6 +209,17 @@ class MultiHeadAttention(nn.Module):
         # (batch, seq_len_k, d_model) -> (batch, h, seq_len_k, d_v)
         V = self.W_v(value).view(batch, -1, self.h, self.d_v).transpose(1, 2)
 
+        if rope_cos is not None and rope_sin is not None:
+            Q, K = apply_rotary_emb(Q, K, rope_cos, rope_sin)
+
+        past_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            K = torch.cat([past_k, K], dim=2)
+            V = torch.cat([past_v, V], dim=2)
+        if use_cache:
+            past_kv = (K.detach(), V.detach())
+
         # (batch, h, seq_len_q, d_v), (batch, h, seq_len_q, seq_len_k)
         attn_output, attn_weights = self.attention(Q, K, V, mask=mask)
 
@@ -209,7 +228,26 @@ class MultiHeadAttention(nn.Module):
         # (batch, seq_len_q, d_model)
         output = self.W_o(attn_output)
 
-        return output, attn_weights
+        return output, attn_weights, past_kv
+
+
+# -----------------------------------------------------------------------------
+# RMSNorm (LLaMA-style)
+# -----------------------------------------------------------------------------
+
+
+class RMSNorm(nn.Module):
+    """Root mean square layer normalization (no mean subtraction). Used in LLaMA."""
+
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (batch, seq, d_model)
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
 
 
 # -----------------------------------------------------------------------------
@@ -248,6 +286,88 @@ class PositionwiseFeedForward(nn.Module):
         x = self.dropout(x)
         # (batch, seq_len, d_ff) -> (batch, seq_len, d_model)
         return self.linear2(x)
+
+
+class PositionwiseFeedForwardGELU(nn.Module):
+    """
+    FFN with GELU activation (GPT-2 / LLaMA style).
+    FFN(x) = (gelu(x W_1) * (x V)) W_2 for SwiGLU; or gelu(x W_1) W_2 for plain GELU.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        dropout: float = 0.1,
+        use_swiglu: bool = False,
+    ) -> None:
+        super().__init__()
+        self.use_swiglu = use_swiglu
+        if use_swiglu:
+            self.w1 = nn.Linear(d_model, d_ff, bias=False)
+            self.w2 = nn.Linear(d_ff, d_model, bias=False)
+            self.w3 = nn.Linear(d_model, d_ff, bias=False)  # gate
+        else:
+            self.linear1 = nn.Linear(d_model, d_ff)
+            self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_swiglu:
+            # SwiGLU: silu(w1(x)) * w3(x) then w2
+            return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        x = F.gelu(self.linear1(x))
+        return self.dropout(self.linear2(x))
+
+
+# -----------------------------------------------------------------------------
+# Rotary Position Embedding (RoPE)
+# -----------------------------------------------------------------------------
+
+
+def apply_rotary_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary position embedding to Q and K. cos, sin shape (seq_len, d_k/2).
+    q, k shape (batch, heads, seq_len, d_k). Modifies in place and returns (q, k).
+    """
+    # (batch, heads, seq_len, d_k) -> (batch, heads, seq_len, d_k/2, 2)
+    d = q.size(-1) // 2
+    q1, q2 = q[..., :d], q[..., d:]
+    k1, k2 = k[..., :d], k[..., d:]
+    # cos, sin (seq_len, d) -> (1, 1, seq_len, d)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    q_rot = torch.stack([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1).flatten(-2)
+    k_rot = torch.stack([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1).flatten(-2)
+    return q_rot, k_rot
+
+
+class RotaryEmbedding(nn.Module):
+    """Rotary position embedding (RoPE). Precomputes cos/sin for positions 0..max_len-1."""
+
+    def __init__(self, dim: int, max_len: int = 8192, base: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.max_len = max_len
+
+    def forward(
+        self,
+        seq_len: int,
+        start: int = 0,
+        device: Optional[torch.device] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cos, sin for positions [start, start+seq_len). For KV cache use start=past_len."""
+        t = torch.arange(
+            start, start + seq_len, device=device or self.inv_freq.device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(t, self.inv_freq)
+        return freqs.cos(), freqs.sin()
 
 
 # -----------------------------------------------------------------------------
@@ -331,7 +451,7 @@ class EncoderLayer(nn.Module):
         """
         # Self-attention with residual and post-norm
         # (batch, seq_len, d_model)
-        attn_out, _ = self.self_attn(x, x, x, mask=padding_mask)
+        attn_out, _, _ = self.self_attn(x, x, x, mask=padding_mask)
         x = self.norm1(x + self.dropout(attn_out))
 
         # FFN with residual and post-norm
@@ -389,11 +509,11 @@ class DecoderLayer(nn.Module):
         """
         # Masked self-attention + residual + post-norm
         # (batch, tgt_len, d_model)
-        self_attn_out, _ = self.self_attn(x, x, x, mask=self_attn_mask)
+        self_attn_out, _, _ = self.self_attn(x, x, x, mask=self_attn_mask)
         x = self.norm1(x + self.dropout(self_attn_out))
 
         # Cross-attention (q from decoder, k/v from encoder) + residual + post-norm
-        cross_attn_out, _ = self.cross_attn(x, memory, memory, mask=cross_attn_mask)
+        cross_attn_out, _, _ = self.cross_attn(x, memory, memory, mask=cross_attn_mask)
         x = self.norm2(x + self.dropout(cross_attn_out))
 
         # FFN + residual + post-norm
@@ -635,6 +755,313 @@ class Transformer(nn.Module):
 
 
 # -----------------------------------------------------------------------------
+# Decoder-only LLM (GPT-style)
+# -----------------------------------------------------------------------------
+
+
+class DecoderOnlyLM(nn.Module):
+    """
+    Decoder-only transformer for causal language modeling (GPT-style LLM).
+    Single stack of layers: masked self-attention + FFN, no encoder or cross-attention.
+    Use for next-token prediction and autoregressive generation.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 512,
+        N: int = 6,
+        h: int = 8,
+        d_k: int = 64,
+        d_v: int = 64,
+        d_ff: int = 2048,
+        max_len: int = 5000,
+        dropout: float = 0.1,
+        padding_idx: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        assert d_model == h * d_k, "d_model must equal h * d_k"
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
+        self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
+        # Reuse EncoderLayer: same structure (self-attn + FFN); we pass causal mask as padding_mask
+        self.layers = nn.ModuleList(
+            [
+                EncoderLayer(d_model, h, d_k, d_v, d_ff, dropout=dropout)
+                for _ in range(N)
+            ]
+        )
+        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Causal forward pass: predict logits for each position given previous tokens.
+
+        Args:
+            input_ids: (batch, seq_len) — token indices.
+            lengths: Optional (batch,) — actual lengths for padding mask.
+
+        Returns:
+            Logits (batch, seq_len, vocab_size). Use for next-token loss: logits[:, :-1] vs input_ids[:, 1:].
+        """
+        seq_len = input_ids.size(1)
+        # (batch, seq_len, d_model)
+        x = self.embedding(input_ids) * math.sqrt(self.d_model)
+        x = self.pos_encoding(x)
+
+        # Causal + optional padding mask for self-attention
+        # (1, 1, seq_len, seq_len)
+        mask = create_causal_mask(seq_len, device=input_ids.device)
+        if lengths is not None:
+            # (batch, 1, 1, seq_len) -> (batch, 1, seq_len, seq_len)
+            pad_mask = create_padding_mask(lengths, seq_len, device=input_ids.device)
+            pad_mask = pad_mask.expand(-1, -1, seq_len, -1)
+            mask = mask | pad_mask
+
+        for layer in self.layers:
+            x = layer(x, padding_mask=mask)
+
+        # (batch, seq_len, vocab_size)
+        logits = self.lm_head(x)
+        return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        eos_token_id: Optional[int] = None,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        do_sample: bool = True,
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation. Extends input_ids by sampling (or greedy) next tokens.
+
+        Args:
+            input_ids: (batch, seq_len) — prompt token indices.
+            max_new_tokens: Maximum number of tokens to generate.
+            eos_token_id: If set, stop when this token is generated.
+            temperature: Sampling temperature (higher = more random).
+            top_k: If set, sample only from top-k logits (None = no cutoff).
+            do_sample: If False, use greedy (argmax) decoding.
+
+        Returns:
+            (batch, seq_len + num_generated) — extended token ids.
+        """
+        self.eval()
+        batch_size = input_ids.size(0)
+        device = next(self.parameters()).device
+        generated = input_ids
+        eos_reached = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for _ in range(max_new_tokens):
+            # Forward on current sequence (causal: only last position matters for next token)
+            logits = self.forward(generated, lengths=None)
+            # (batch, vocab_size)
+            next_logits = logits[:, -1, :]
+
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
+            if top_k is not None:
+                v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                next_logits[next_logits < v[:, -1].unsqueeze(-1)] = float("-inf")
+
+            if do_sample:
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+            generated = torch.cat([generated, next_token], dim=1)
+            if eos_token_id is not None:
+                eos_reached = eos_reached | (next_token.squeeze(-1) == eos_token_id)
+                if eos_reached.all():
+                    break
+
+        return generated
+
+
+# -----------------------------------------------------------------------------
+# Modern LLM (Claude / GPT / LLaMA style): pre-norm, RMSNorm, GELU, RoPE, KV cache
+# -----------------------------------------------------------------------------
+
+
+class LLMLayer(nn.Module):
+    """
+    Single decoder-only layer with pre-norm (RMSNorm), self-attention with RoPE, and GELU FFN.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        h: int,
+        d_k: int,
+        d_v: int,
+        d_ff: int,
+        dropout: float = 0.1,
+        use_swiglu: bool = False,
+    ) -> None:
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.self_attn = MultiHeadAttention(d_model, h, d_k, d_v, dropout=dropout)
+        self.ffn_norm = RMSNorm(d_model)
+        self.ffn = PositionwiseFeedForwardGELU(d_model, d_ff, dropout=dropout, use_swiglu=use_swiglu)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+        past_key_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+        # Pre-norm + self-attention + residual
+        # (batch, seq_len, d_model)
+        x_norm = self.attn_norm(x)
+        attn_out, _, past_kv = self.self_attn(
+            x_norm, x_norm, x_norm,
+            mask=mask,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
+        x = x + self.dropout(attn_out)
+        # Pre-norm + FFN + residual
+        x = x + self.dropout(self.ffn(self.ffn_norm(x)))
+        return x, past_kv
+
+
+class LLM(nn.Module):
+    """
+    Modern decoder-only LLM: pre-norm, RMSNorm, GELU (or SwiGLU), RoPE, optional KV cache.
+    Similar in spirit to LLaMA / GPT-2 / Claude-style models.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 512,
+        N: int = 6,
+        h: int = 8,
+        d_k: int = 64,
+        d_v: int = 64,
+        d_ff: int = 2048,
+        max_len: int = 8192,
+        dropout: float = 0.1,
+        padding_idx: Optional[int] = None,
+        use_swiglu: bool = False,
+    ) -> None:
+        super().__init__()
+        assert d_model == h * d_k
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
+        self.rope = RotaryEmbedding(dim=d_k, max_len=max_len)
+        self.layers = nn.ModuleList([
+            LLMLayer(d_model, h, d_k, d_v, d_ff, dropout=dropout, use_swiglu=use_swiglu)
+            for _ in range(N)
+        ])
+        self.final_norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.max_len = max_len
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+        past_key_values: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, Optional[list[tuple[torch.Tensor, torch.Tensor]]]]:
+        """
+        Returns logits and optionally updated key-value cache for generation.
+        """
+        seq_len = input_ids.size(1)
+        past_len = past_key_values[0][0].size(2) if (past_key_values is not None and len(past_key_values) > 0) else 0
+        # (batch, seq_len, d_model) — no scale by sqrt(d_model) for modern LLMs
+        x = self.embedding(input_ids)
+
+        rope_cos, rope_sin = self.rope(seq_len, start=past_len, device=x.device)
+
+        mask = None
+        if past_len == 0:
+            mask = create_causal_mask(seq_len, device=input_ids.device)
+            if lengths is not None:
+                pad_mask = create_padding_mask(lengths, seq_len, device=input_ids.device)
+                pad_mask = pad_mask.expand(-1, -1, seq_len, -1)
+                mask = mask | pad_mask
+        # When using cache we only have one new token; causal is handled by cache
+
+        present_key_values = [] if use_cache else None
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values else None
+            x, pkv = layer(x, mask=mask, rope_cos=rope_cos, rope_sin=rope_sin,
+                            past_key_value=past_kv, use_cache=use_cache)
+            if use_cache:
+                present_key_values.append(pkv)
+
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+        return logits, present_key_values
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        eos_token_id: Optional[int] = None,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        do_sample: bool = True,
+    ) -> torch.Tensor:
+        """Autoregressive generation with KV cache for efficiency."""
+        self.eval()
+        batch_size = input_ids.size(0)
+        device = next(self.parameters()).device
+        past_key_values: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
+        generated = input_ids
+        eos_reached = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for _ in range(max_new_tokens):
+            use_cache = past_key_values is not None
+            # When we have cache, we only pass the last token
+            if use_cache:
+                ids = generated[:, -1:]
+            else:
+                ids = generated
+            logits, past_key_values = self.forward(ids, past_key_values=past_key_values, use_cache=True)
+            next_logits = logits[:, -1, :]
+
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
+            if top_k is not None:
+                v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                next_logits[next_logits < v[:, -1].unsqueeze(-1)] = float("-inf")
+
+            if do_sample:
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+            generated = torch.cat([generated, next_token], dim=1)
+            if eos_token_id is not None:
+                eos_reached = eos_reached | (next_token.squeeze(-1) == eos_token_id)
+                if eos_reached.all():
+                    break
+
+        return generated
+
+
+# -----------------------------------------------------------------------------
 # Smoke test
 # -----------------------------------------------------------------------------
 
@@ -688,7 +1115,45 @@ def smoke_test() -> None:
         logits_masked = model(src, tgt, src_lengths=src_lengths, tgt_lengths=tgt_lengths)
     assert logits_masked.shape == (batch_size, tgt_len, tgt_vocab_size)
 
-    print("Smoke test passed: output shape (2, 10, 1000).")
+    # Decoder-only LLM smoke test
+    lm = DecoderOnlyLM(
+        vocab_size=1000,
+        d_model=512,
+        N=6,
+        h=8,
+        d_k=64,
+        d_v=64,
+        d_ff=2048,
+        dropout=0.1,
+    )
+    lm.eval()
+    with torch.no_grad():
+        ids = torch.randint(0, 1000, (2, 10))
+        logits_lm = lm(ids)
+    assert logits_lm.shape == (2, 10, 1000)
+    out = lm.generate(ids, max_new_tokens=5, do_sample=False)
+    assert out.shape == (2, 15)
+
+    # Modern LLM (RoPE, pre-norm, KV cache)
+    modern = LLM(
+        vocab_size=1000,
+        d_model=256,
+        N=2,
+        h=4,
+        d_k=64,
+        d_v=64,
+        d_ff=512,
+        max_len=128,
+        dropout=0.1,
+    )
+    modern.eval()
+    with torch.no_grad():
+        logits_m, _ = modern(ids, use_cache=False)
+    assert logits_m.shape == (2, 10, 1000)
+    out_m = modern.generate(ids, max_new_tokens=5, do_sample=False)
+    assert out_m.shape == (2, 15)
+
+    print("Smoke test passed: encoder-decoder; DecoderOnlyLM; LLM (RoPE, KV cache).")
 
 
 if __name__ == "__main__":
